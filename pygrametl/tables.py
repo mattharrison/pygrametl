@@ -45,13 +45,15 @@ from time import sleep
 import types
 import tempfile
 
+import sqlalchemy as sa
+
 import pygrametl
 import pygrametl.parallel
 from pygrametl.FIFODict import FIFODict
 
 __author__ = "Christian Thomsen"
 __maintainer__ = "Christian Thomsen"
-__version__ = '0.2.0.1'
+__version__ = '0.2.0.3'
 __all__ = ['Dimension', 'CachedDimension', 'SlowlyChangingDimension',
            'SnowflakedDimension', 'FactTable', 'BatchFactTable',
            'BulkFactTable', 'SubprocessFactTable']
@@ -59,32 +61,32 @@ __all__ = ['Dimension', 'CachedDimension', 'SlowlyChangingDimension',
 class Dimension(object):
     """A class for accessing a dimension. Does no caching."""
 
-    def __init__(self, name, key, attributes, lookupatts=(), 
+    def __init__(self, name, key, attributes, lookupatts=(),
                  idfinder=None, defaultidvalue=None, rowexpander=None,
                 targetconnection=None):
         """Arguments:
            - name: the name of the dimension table in the DW
            - key: the name of the primary key in the DW
-           - attributes: a sequence of the attribute names in the dimension 
+           - attributes: a sequence of the attribute names in the dimension
              table. Should not include the name of the primary key which is
              given in the key argument.
            - lookupatts: A subset of the attributes that uniquely identify
              a dimension members. These attributes are thus used for looking
-             up members. If not given, it is assumed that 
+             up members. If not given, it is assumed that
              lookupatts = attributes
            - idfinder: A function(row, namemapping) -> key value that assigns
              a value to the primary key attribute based on the content of the
              row and namemapping. If not given, it is assumed that the primary
              key is an integer, and the assigned key value is then the current
              maximum plus one.
-           - defaultidvalue: An optional value to return when a lookup fails. 
+           - defaultidvalue: An optional value to return when a lookup fails.
              This should thus be the ID for a preloaded "Unknown" member.
            - rowexpander: A function(row, namemapping) -> row. This function
              is called by ensure before insertion if a lookup of the row fails.
              This is practical if expensive calculations only have to be done
              for rows that are not already present. For example, for a date
              dimension where the full date is used for looking up rows, a
-             rowexpander can be set such that week day, week number, season, 
+             rowexpander can be set such that week day, week number, season,
              year, etc. are only calculated for dates that are not already
              represented. If not given, no automatic expansion of rows is
              done.
@@ -112,50 +114,65 @@ class Dimension(object):
         self.defaultidvalue = defaultidvalue
         self.rowexpander = rowexpander
         pygrametl._alltables.append(self)
+        self._init_sql()
+        if idfinder is not None:
+            self.idfinder = idfinder
+        else:
+            self.idfinder = self._get_idfinder()
 
+    def _init_sql(self):
         # Now create the SQL that we will need...
 
-        # This gives "SELECT key FROM name WHERE lookupval1 = %(lookupval1)s 
+        # This gives "SELECT key FROM name WHERE lookupval1 = %(lookupval1)s
         #             AND lookupval2 = %(lookupval2)s AND ..."
         self.keylookupsql = "SELECT " + key + " FROM " + name + " WHERE " + \
-            " AND ".join(["%s = %%(%s)s" % (lv, lv) for lv in lookupatts])
+            " AND ".join(["%s = %%(%s)s" % (lv, lv) for lv in self.lookupatts])
 
         # This gives "SELECT key, att1, att2, ... FROM NAME WHERE key = %(key)s"
         self.rowlookupsql = "SELECT " + ", ".join(self.all) +  \
             " FROM %s WHERE %s = %%(%s)s" % (name, key, key)
 
-        # This gives "INSERT INTO name(key, att1, att2, ...) 
+        # This gives "INSERT INTO name(key, att1, att2, ...)
         #             VALUES (%(key)s, %(att1)s, %(att2)s, ...)"
         self.insertsql = "INSERT INTO " + name + "(%s" % (key,) + \
             (attributes and ", " or "") + \
             ", ".join(attributes) + ") VALUES (" + \
             ", ".join(["%%(%s)s" % (att,) for att in self.all]) + ")"
 
-        if idfinder is not None:
-            self.idfinder = idfinder
-        else:
-            self.targetconnection.execute("SELECT MAX(%s) FROM %s" % \
-                                              (key, name))
-            self.__maxid = self.targetconnection.fetchonetuple()[0]
-            if self.__maxid is None:
-                self.__maxid = 0
-            self.idfinder = self._getnextid
+
+    def _get_idfinder(self):
+
+        self.targetconnection.execute("SELECT MAX(%s) FROM %s" % \
+                                          (self.key, self.name))
+        #self._maxid = self.targetconnection.fetchonetuple()[0]
+        self._maxid = self.targetconnection.fetchone()[0]
+        if self._maxid is None:
+            self._maxid = 0
+        return self._getnextid
 
 
-    def lookup(self, row, namemapping={}):
+
+    def lookup(self, row, namemapping=None):
         """ Find the key for the row with the given values.
 
             Arguments:
             - row: a dict which must contain at least the lookup attributes
             - namemapping: an optional namemapping (see module's documentation)
         """
+        namemapping = namemapping or {}
         key = self._before_lookup(row, namemapping)
         if key is not None:
             return key
-        
-        self.targetconnection.execute(self.keylookupsql, row, namemapping)
-        
-        keyvalue = self.targetconnection.fetchonetuple()[0]
+
+        if namemapping and row:
+            row = pygrametl.copy(row, **namemapping)
+            sql = self.keylookupsql % row
+        #self.targetconnection.execute(self.keylookupsql, row)
+        self.targetconnection.execute(sql)
+        #, namemapping)
+
+        #keyvalue = self.targetconnection.fetchonetuple()[0]
+        keyvalue = self.targetconnection.fetchone()[0]
         if keyvalue is None:
             keyvalue = self.defaultidvalue  # most likely also None...
 
@@ -205,7 +222,7 @@ class Dimension(object):
         if res is not None:
             return res
 
-        # select all attributes from the table. The attributes available from 
+        # select all attributes from the table. The attributes available from
         # the values dict are used in the WHERE clause.
         attstouse = [a for a in self.attributes \
                          if a in values or a in namemapping]
@@ -231,7 +248,7 @@ class Dimension(object):
            Arguments:
             - row: a dict which must contain the key for the dimension.
               The row with this key value is updated such that it takes
-              the value of row[att] for each attribute att which is also in 
+              the value of row[att] for each attribute att which is also in
               row.
             - namemapping: an optional namemapping (see module's documentation)
         """
@@ -268,8 +285,8 @@ class Dimension(object):
            instance, this rowexpander is called before the insert takes place.
 
            Arguments:
-           - row: the row to lookup or insert. Must contain the lookup 
-             attributes. 
+           - row: the row to lookup or insert. Must contain the lookup
+             attributes.
            - namemapping: an optional namemapping (see module's documentation)
         """
         res = self.lookup(row, namemapping)
@@ -301,12 +318,15 @@ class Dimension(object):
         else:
             keyval = row[key]
             keyadded = False
+        self._insert(row, namemapping)
 
-        self.targetconnection.execute(self.insertsql, row, namemapping)
         if keyadded:
             del row[key]
         self._after_insert(row, namemapping, keyval)
         return keyval
+
+    def _insert(self, row, namemapping):
+        self.targetconnection.execute(self.insertsql, row, namemapping)
 
     def _before_insert(self, row, namemapping):
         return None
@@ -315,14 +335,74 @@ class Dimension(object):
         pass
 
 
+
     def _getnextid(self, ignoredrow, ignoredmapping):
-        self.__maxid += 1
-        return self.__maxid
+        self._maxid += 1
+        return self._maxid
 
     def endload(self):
         """Finalize the load."""
         pass
 
+
+
+class SADimension(Dimension):
+    """Uses sqlalchemy connection"""
+
+
+    def _init_sql(self):
+        meta = sa.MetaData()
+        self.sa_table = sa.Table(self.name, meta,
+                                 autoload=True,
+                                 autoload_with=self.targetconnection.engine)
+
+        txt = """SELECT :key
+FROM :name
+WHERE """
+        where = []
+        for item in self.lookupatts:
+            where.append(':%s = :%s' %(item, item+'_val'))
+
+        self.keylookupsql = sa.text(txt + ' AND '.join(where))
+
+    def _get_idfinder(self):
+
+        s = sa.text("SELECT MAX(:key) FROM :name")
+        s = sa.text("SELECT MAX(%s) FROM %s" % \
+            (self.key, self.name))
+        #s = sa.text("SELECT 1 from device;")
+        select = sa.select([sa.sql.func.max(self.sa_table.c[self.key])])
+        self._maxid = self.targetconnection.execute(select).fetchone()[0]
+        # self._maxid = self.targetconnection.execute(s,
+        #key=self.key, name=self.name).fetchone()[0]
+        #import pdb;pdb.set_trace()
+        if self._maxid is None:
+            self._maxid = 0
+        return self._getnextid
+
+
+    def lookup(self, row, namemapping=None):
+        namemapping = namemapping or {}
+        mapping = pygrametl.copy(row, **namemapping)
+        select = sa.select([self.sa_table.c[self.key]],
+                           sa.and_(*[self.sa_table.c[item] == mapping[item] for item in self.lookupatts]))
+        keyvalue = self.targetconnection.execute(select).fetchone()
+        # if hasattr(keyvalue, '__iter__'):
+        #     import pdb;pdb.set_trace()
+        if not keyvalue:
+            keyvalue = self.defaultidvalue
+        else:
+            keyvalue = keyvalue[0]
+        self._after_lookup(row, namemapping, keyvalue)
+        return keyvalue
+
+    def _insert(self, row, namemapping):
+        #import pdb;pdb.set_trace()
+        print "COLS", [col.name for col in self.sa_table.columns], namemapping
+        values = dict([(col.name, row[namemapping.get(col.name, col.name)]) for col in self.sa_table.columns])
+        print "VAL", values
+        ins = self.sa_table.insert().values(**values)
+        self.targetconnection.execute(ins)
 
 
 
@@ -334,33 +414,33 @@ class CachedDimension(Dimension):
        For example, a DEFAULT value in the DB can break this assumption.
     """
 
-    def __init__(self, name, key, attributes, lookupatts=(), 
+    def __init__(self, name, key, attributes, lookupatts=(),
                  idfinder=None, defaultidvalue=None, rowexpander=None,
                  size=10000, prefill=False, cachefullrows=False,
                  cacheoninsert=True, targetconnection=None):
         """Arguments:
            - name: the name of the dimension table in the DW
            - key: the name of the primary key in the DW
-           - attributes: a sequence of the attribute names in the dimension 
+           - attributes: a sequence of the attribute names in the dimension
              table. Should not include the name of the primary key which is
              given in the key argument.
            - lookupatts: A subset of the attributes that uniquely identify
              a dimension members. These attributes are thus used for looking
-             up members. If not given, it is assumed that 
+             up members. If not given, it is assumed that
              lookupatts = attributes
            - idfinder: A function(row, namemapping) -> key value that assigns
              a value to the primary key attribute based on the content of the
              row and namemapping. If not given, it is assumed that the primary
              key is an integer, and the assigned key value is then the current
              maximum plus one.
-           - defaultidvalue: An optional value to return when a lookup fails. 
+           - defaultidvalue: An optional value to return when a lookup fails.
              This should thus be the ID for a preloaded "Unknown" member.
            - rowexpander: A function(row, namemapping) -> row. This function
              is called by ensure before insertion if a lookup of the row fails.
              This is practical if expensive calculations only have to be done
              for rows that are not already present. For example, for a date
              dimension where the full date is used for looking up rows, a
-             rowexpander can be set such that week day, week number, season, 
+             rowexpander can be set such that week day, week number, season,
              year, etc. are only calculated for dates that are not already
              represented. If not given, no automatic expansion of rows is
              done.
@@ -377,7 +457,7 @@ class CachedDimension(Dimension):
              the default target connection is used.
         """
 
-        Dimension.__init__(self, name, key, attributes, lookupatts, idfinder, 
+        Dimension.__init__(self, name, key, attributes, lookupatts, idfinder,
                            defaultidvalue, rowexpander, targetconnection)
         self.cacheoninsert = cacheoninsert
         self.__prefill = prefill
@@ -408,9 +488,11 @@ class CachedDimension(Dimension):
 
             self.targetconnection.execute(sql)
             if size <= 0:
-                data = self.targetconnection.fetchalltuples()
+                #data = self.targetconnection.fetchalltuples()
+                data = self.targetconnection.fetchall()
             else:
-                data = self.targetconnection.fetchmanytuples(size)
+                #data = self.targetconnection.fetchmanytuples(size)
+                data = self.targetconnection.fetchmany(size)
 
             for rawrow in data:
                 if cachefullrows:
@@ -470,7 +552,7 @@ class CachedDimension(Dimension):
                 if searchtuple in self.__vals2key:
                     del self.__vals2key[searchtuple]
                 break
-                
+
 
         if self.cachefullrows:
             if row[key] in self.__key2row:
@@ -482,7 +564,7 @@ class CachedDimension(Dimension):
 
     def _after_insert(self, row, namemapping, newkeyvalue):
         """ """
-        # After the insert, we can look the row up. Pretend that we 
+        # After the insert, we can look the row up. Pretend that we
         # did that. Then we get the new data cached.
         # NB: Here we assume that the DB doesn't change or add anything.
         # For example, a DEFAULT value in the DB breaks this assumption.
@@ -508,7 +590,7 @@ class SlowlyChangingDimension(Dimension):
        For example, a DEFAULT value in the DB can break this assumption.
     """
 
-    def __init__(self, name, key, attributes, lookupatts, versionatt, 
+    def __init__(self, name, key, attributes, lookupatts, versionatt,
                  fromatt=None, fromfinder=None,
                  toatt=None, tofinder=None, maxto=None,
                  srcdateatt=None, srcdateparser=pygrametl.ymdparser,
@@ -517,25 +599,25 @@ class SlowlyChangingDimension(Dimension):
         """Arguments:
            - name: the name of the dimension table in the DW
            - key: the name of the primary key in the DW
-           - attributes: a sequence of the attribute names in the dimension 
+           - attributes: a sequence of the attribute names in the dimension
              table. Should not include the name of the primary key which is
              given in the key argument, but should include versionatt,
              fromatt, and toatt.
-           - lookupatts: a sequence with a subset of the attributes that 
-             uniquely identify a dimension members. These attributes are thus 
-             used for looking up members. If not given, it is assumed that 
+           - lookupatts: a sequence with a subset of the attributes that
+             uniquely identify a dimension members. These attributes are thus
+             used for looking up members. If not given, it is assumed that
              lookupatts = attributes
            - versionatt: the name of the attribute holding the version number
            - fromatt: the name of the attribute telling from when the version
              becomes valid. Not used if None. Default: None
-           - fromfinder: a function(targetconnection, row, namemapping) 
+           - fromfinder: a function(targetconnection, row, namemapping)
              returning a value for the fromatt for a new version (the function
              is first used when it is determined that a new version must be
-             added; it is not applied to determine this). 
-             If fromfinder is None and srcdateatt is also None, 
-             pygrametl.today is used as fromfinder. If fromfinder is None 
-             and srcdateatt is not None, 
-             pygrametl.datereader(srcdateatt, srcdateparser) is used. 
+             added; it is not applied to determine this).
+             If fromfinder is None and srcdateatt is also None,
+             pygrametl.today is used as fromfinder. If fromfinder is None
+             and srcdateatt is not None,
+             pygrametl.datereader(srcdateatt, srcdateparser) is used.
              In other words, if no date attribute and no special
              date function are given, new versions get the date of the current
              day. If a date attribute is given (but no date function), the
@@ -575,10 +657,10 @@ class SlowlyChangingDimension(Dimension):
            - targetconnection: The ConnectionWrapper to use. If not given,
              the default target connection is used.
         """
-        # TODO: Should scdensure just override ensure instead of being a new 
+        # TODO: Should scdensure just override ensure instead of being a new
         #       method?
 
-        Dimension.__init__(self, name, key, attributes, lookupatts, 
+        Dimension.__init__(self, name, key, attributes, lookupatts,
                            idfinder, None, None, targetconnection)
 
         if not versionatt:
@@ -610,7 +692,7 @@ class SlowlyChangingDimension(Dimension):
         self.__cachesize = cachesize
         self.__prefill = prefill
 
-        # Check that versionatt, fromatt and toatt are also declared as 
+        # Check that versionatt, fromatt and toatt are also declared as
         # attributes
         for var in (versionatt, fromatt, toatt):
             if var and var not in attributes:
@@ -636,7 +718,7 @@ class SlowlyChangingDimension(Dimension):
             # Select all attributes from the rows where maxto is set to the
             # default value (which may be NULL)
             sql = 'SELECT %s FROM %s WHERE %s %s' % \
-                (', '.join(self.all), self.name, self.toatt, 
+                (', '.join(self.all), self.name, self.toatt,
                  self.maxto is None and 'IS NULL' or '= %(maxto)s')
             if self.maxto is not None:
                 args = {'maxto':self.maxto}
@@ -652,9 +734,9 @@ class SlowlyChangingDimension(Dimension):
                                          [self.versionatt]
                                      ])
             sql = 'SELECT %s FROM (%s) AS A, %s AS B WHERE %s' %\
-                (', '.join(['B.%s AS %s' % (att, att) for att in self.all]), 
+                (', '.join(['B.%s AS %s' % (att, att) for att in self.all]),
                  newestversions, self.name, joincond)
-            
+
         # sql is a statement that fetches the newest versions. Fill the caches
         positions = [self.all.index(att) for att in self.lookupatts]
         self.targetconnection.execute(sql, args)
@@ -687,7 +769,7 @@ class SlowlyChangingDimension(Dimension):
            NB: Has side-effects on the given row.
 
            Arguments:
-           - row: a dict containing the attributes for the member. 
+           - row: a dict containing the attributes for the member.
              key, versionatt, fromatt, and toatt are not required to be
              present but will be added (if defined).
            - namemapping: an optional namemapping (see module's documentation)
@@ -713,14 +795,14 @@ class SlowlyChangingDimension(Dimension):
             # It is a new member. We add the first version.
             row[versionatt] = 1
             if fromatt and fromatt not in row:
-                row[fromatt] = self.fromfinder(self.targetconnection, 
+                row[fromatt] = self.fromfinder(self.targetconnection,
                                                row, namemapping)
             if toatt and toatt not in row:
                 row[toatt] = self.maxto
             row[key] = self.insert(row, namemapping)
             return row[key]
         else:
-            # There is an existing version. Check if the attributes are 
+            # There is an existing version. Check if the attributes are
             # identical
             type1updates = {} # for type 1
             addnewversion = False # for type 2
@@ -728,7 +810,7 @@ class SlowlyChangingDimension(Dimension):
             for att in self.all:
                 # Special (non-)handling of versioning and key attributes:
                 if att in (self.key, self.versionatt, self.toatt):
-                    # Don't compare these - we don't expect them to have 
+                    # Don't compare these - we don't expect them to have
                     # meaningful values in row
                     continue
                 # We may have to compare the "from dates"
@@ -772,22 +854,22 @@ class SlowlyChangingDimension(Dimension):
             if len(type1updates) > 0:
                 # Some type 1 updates were found
                 self.__performtype1updates(type1updates, other)
-            
+
             if addnewversion: # type 2
                 # Make a new row version and insert it
                 row.pop(key, None)
                 row[versionatt] = other[self.versionatt] + 1
                 if fromatt:
-                    row[fromatt] = self.fromfinder(self.targetconnection, 
+                    row[fromatt] = self.fromfinder(self.targetconnection,
                                                    row, namemapping)
                 if toatt:
                     row[toatt] = self.maxto
                 row[key] = self.insert(row, namemapping)
                 # Update the todate attribute in the old row version in the DB.
                 if toatt:
-                    toattval = self.tofinder(self.targetconnection, row, 
+                    toattval = self.tofinder(self.targetconnection, row,
                                              namemapping)
-                    self.targetconnection.execute(self.updatetodatesql, 
+                    self.targetconnection.execute(self.updatetodatesql,
                                      {self.key : keyval, self.toatt : toattval})
                 # Only cache the newest version - this is new in ver. 0.2.0!
                 if keyval in self.rowcache:
@@ -855,7 +937,7 @@ class SlowlyChangingDimension(Dimension):
 
     def _after_insert(self, row, namemapping, newkeyvalue):
         """ """
-        # After the insert, we can look it up. Pretend that we 
+        # After the insert, we can look it up. Pretend that we
         # did that. Then we get the new data cached.
         # NB: Here we assume that the DB doesn't change or add anything.
         # For example, a DEFAULT value in the DB breaks this assumption.
@@ -870,7 +952,7 @@ class SlowlyChangingDimension(Dimension):
     def __performtype1updates(self, updates, lookupvalues, namemapping={}):
         """ """
         # find the keys in the rows that should be updated
-        self.targetconnection.execute(self.keylookupsql, lookupvalues, 
+        self.targetconnection.execute(self.keylookupsql, lookupvalues,
                                       namemapping)
         updatekeys = [e[0] for e in self.targetconnection.fetchalltuples()]
         updatekeys.reverse()
@@ -884,8 +966,8 @@ class SlowlyChangingDimension(Dimension):
         for key in updatekeys:
             if key in self.rowcache:
                 del self.rowcache[key]
-        
-                
+
+
 SCDimension = SlowlyChangingDimension
 
 
@@ -904,14 +986,14 @@ class SnowflakedDimension(object):
 
     def __init__(self, references, expectboguskeyvalues=False):
         """Arguments:
-           - references: a sequence of pairs of Dimension objects 
-             [(a1,a2), (b1,b2), ...] meaning that a1 has a foreign key to a2 
+           - references: a sequence of pairs of Dimension objects
+             [(a1,a2), (b1,b2), ...] meaning that a1 has a foreign key to a2
              etc. a2 may itself be a sequence of Dimensions:
              [(a1, [a21, a22, ...]), (b1, [b21, b22, ...]), ...].
 
              The first element of the first pair (a1 in the example above) must
-             be the dimension table representing the lowest level in the 
-             hierarchy (i.e., the dimension table the closest to the fact 
+             be the dimension table representing the lowest level in the
+             hierarchy (i.e., the dimension table the closest to the fact
              table).
 
              Each dimension must be reachable in a unique way (i.e., the
@@ -939,7 +1021,7 @@ class SnowflakedDimension(object):
         self.all = self.root.all[:]
         for (dim, refeddims) in references:
             # Check that all dimensions use the same target connection.
-            # Build the dict self.refs: 
+            # Build the dict self.refs:
             #           {dimension -> set(refed dimensions)}
             # Build self.all from dimensions' lists
             # Keep track of seen dimensions by means of the set dims and
@@ -1046,12 +1128,12 @@ class SnowflakedDimension(object):
         if not fullrow:
             res = self.root.getbykey(keyvalue)
         else:
-            self.targetconnection.execute(self.rowlookupsql, 
+            self.targetconnection.execute(self.rowlookupsql,
                                            {self.root.key : keyvalue})
             res = self.targetconnection.fetchone(self.allnames)
         self._after_getbykey(keyvalue, res, fullrow)
         return res
-            
+
 
     def _before_getbykey(self, keyvalue, fullrow=False):
         return None
@@ -1079,14 +1161,14 @@ class SnowflakedDimension(object):
         if not fullrow:
             res = self.root.getbyvals(values, namemapping)
         else:
-            # select all attributes from the table. 
+            # select all attributes from the table.
             # The attributes available from the
             # values dict are used in the WHERE clause.
             attstouse = [a for a in self.allnames \
-                             if a in values or a in namemapping] 
+                             if a in values or a in namemapping]
             sqlwhere = " WHERE " + \
                 " AND ".join(["%s = %%(%s)s" % (att, att) for att in attstouse])
-            self.targetconnection.execute(self.alljoinssql + sqlwhere, 
+            self.targetconnection.execute(self.alljoinssql + sqlwhere,
                                            values, namemapping)
             res = [r for r in self.targetconnection.rowfactory(self.allnames)]
 
@@ -1103,7 +1185,7 @@ class SnowflakedDimension(object):
     def update(self, row, namemapping={}):
         """Update rows in the participating dimension tables.
 
-           If the key of a participating dimension D is in the given row, 
+           If the key of a participating dimension D is in the given row,
            D.update(...) is invoked.
 
            Note that this function is not good to use for updating a foreign
@@ -1113,7 +1195,7 @@ class SnowflakedDimension(object):
 
            In other words, it is often better to use the update function
            directly on the Dimensions that should be updated.
-           
+
            Arguments:
             - row: a dict. If the key of a participating dimension D is in the
               dict, D.update(...) is invoked.
@@ -1149,11 +1231,11 @@ class SnowflakedDimension(object):
            afterwards.
 
            Arguments:
-           - row: the row to lookup or insert. Must contain the lookup 
-             attributes. 
+           - row: the row to lookup or insert. Must contain the lookup
+             attributes.
            - namemapping: an optional namemapping (see module's documentation)
         """
-        (key, ignored) = self.__ensure_helper(self.root, row, namemapping, 
+        (key, ignored) = self.__ensure_helper(self.root, row, namemapping,
                                               False)
         return key
 
@@ -1169,14 +1251,14 @@ class SnowflakedDimension(object):
            afterwards.
 
            Arguments:
-           - row: the row to lookup or insert. Must contain the lookup 
-             attributes. 
+           - row: the row to lookup or insert. Must contain the lookup
+             attributes.
            - namemapping: an optional namemapping (see module's documentation)
         """
         key = self._before_insert(row, namemapping)
         if key is not None:
             return key
-        (key, insertdone) = self.__ensure_helper(self.root, row, namemapping, 
+        (key, insertdone) = self.__ensure_helper(self.root, row, namemapping,
                                                  False)
         if not insertdone:
             raise ValueError, "Member already present - nothing inserted"
@@ -1203,25 +1285,25 @@ class SnowflakedDimension(object):
         try:
             key = dimension.lookup(row, namemapping)
         except KeyError:
-            retry = True # it can happen that the keys for the levels above 
-                         # aren't there yet but should be used as lookup 
+            retry = True # it can happen that the keys for the levels above
+                         # aren't there yet but should be used as lookup
                          # attributes in dimension.
-                         # Below we find them and we should then try a 
+                         # Below we find them and we should then try a
                          # lookup again before we move on to do an insertion
         if key is not None:
             row[(namemapping.get(dimension.key) or dimension.key)] = key
             return (key, insertdone)
         # Else recursively get keys for refed tables and then insert
         for refed in self.refs.get(dimension, []):
-            (key, insertdone) = self.__ensure_helper(refed, row, namemapping, 
+            (key, insertdone) = self.__ensure_helper(refed, row, namemapping,
                                                      insertdone)
-            # We don't need to set the key value in the row as this already 
+            # We don't need to set the key value in the row as this already
             # happened in the recursive step.
 
-        # We set insertdone = True to know later that we actually 
+        # We set insertdone = True to know later that we actually
         #inserted something
         if retry or self.expectboguskeyvalues:
-            # The following is similar to 
+            # The following is similar to
             #   key = dimension.ensure(row, namemapping)
             # but we set insertdone here.
             key = dimension.lookup(row, namemapping)
@@ -1229,8 +1311,8 @@ class SnowflakedDimension(object):
                 key = dimension.insert(row, namemapping)
                 insertdone = True
         else:
-            # We don't need to lookup again since no attributes were 
-            # missing (no KeyError) and we don't expect bogus values. 
+            # We don't need to lookup again since no attributes were
+            # missing (no KeyError) and we don't expect bogus values.
             # So we can proceed directly to do an insert.
             key = dimension.insert(row, namemapping)
             insertdone = True
@@ -1247,7 +1329,7 @@ class SnowflakedDimension(object):
            NB: Has side-effects on the given row.
 
            Arguments:
-           - row: a dict containing the attributes for the member. 
+           - row: a dict containing the attributes for the member.
            - namemapping: an optional namemapping (see module's documentation)
         """
         # Still experimental!!! For now we require that only the
@@ -1256,7 +1338,7 @@ class SnowflakedDimension(object):
         # that those between those nodes and the root (incl.) were also
         # SCDs.
         for dim in self.levels.get(1, []):
-            (keyval, ignored) = self.__ensure_helper(dim, row, namemapping, 
+            (keyval, ignored) = self.__ensure_helper(dim, row, namemapping,
                                                      False)
             row[(namemapping.get(dim.key) or dim.key)] = keyval
 
@@ -1288,18 +1370,21 @@ class FactTable(object):
         self.all = [k for k in keyrefs] + [m for m in measures]
         pygrametl._alltables.append(self)
 
+        self._init_sql()
+
+    def _init_sql(self):
         # Create SQL
 
         # INSERT INTO name (key1, ..., keyn, meas1, ..., measn)
         # VALUES (%(key1)s, ..., %(keyn)s, %(meas1)s, ..., %(measn)s)
-        self.insertsql = "INSERT INTO " + name + "(" + \
+        self.insertsql = "INSERT INTO " + self.name + "(" + \
             ", ".join(keyrefs) + (measures and ", " or "") + \
             ", ".join(measures) + ") VALUES (" + \
             ", ".join(["%%(%s)s" % (att,) for att in self.all]) + ")"
 
         # SELECT key1, ..., keyn, meas1, ..., measn FROM name
         # WHERE key1 = %(key1)s AND ... keyn = %(keyn)s
-        self.lookupsql = "SELECT " + ",".join(self.all) + " FROM " + name + \
+        self.lookupsql = "SELECT " + ",".join(self.all) + " FROM " + self.name + \
             " WHERE " + " AND ".join(["%s = %%(%s)s" % (k, k) \
                                           for k in self.keyrefs])
 
@@ -1313,8 +1398,11 @@ class FactTable(object):
         tmp = self._before_insert(row, namemapping)
         if tmp:
             return
-        self.targetconnection.execute(self.insertsql, row, namemapping)
+        self._insert(row, namemapping)
         self._after_insert(row, namemapping)
+
+    def _insert(self, row, namemapping):
+        self.targetconnection.execute(self.insertsql, row, namemapping)
 
     def _before_insert(self, row, namemapping):
         return None
@@ -1322,24 +1410,36 @@ class FactTable(object):
     def _after_insert(self, row, namemapping):
         pass
 
+    def _emptyfacttonone(self, argdict):
+        """Return None if the given argument only contains None values,
+           otherwise return the given argument
+        """
+        for k in self.keyrefs:
+            if argdict[k] is not None:
+                return argdict
+        return None
+
+
     def lookup(self, keyvalues, namemapping={}):
         """Lookup a fact from the given key values. Return key and measure vals.
+
+           Return None if no fact is found.
 
            Arguments:
            - keyvalues: a dict at least containing values for all keys
            - namemapping: an optional namemapping (see module's documentation)
         """
-        res = self._before_lookup(keyvalues, namemapping)
+        res = self._before_lookup(sefl, keyvalues, namemapping)
         if res:
-            return res
+            returnself._emptyfacttonone(res)
         self.targetconnection.execute(self.lookupsql, keyvalues, namemapping)
         res = self.targetconnection.fetchone(self.all)
         usedkeys = [key for key in self.keyrefs if res[key] is not None] #has values for keyrefs?
         if(len(usedkeys) == 0):
             return None
-        
+
         self._after_lookup(keyvalues, namemapping, res)
-        return res
+        return self._emptyfacttonone(res)
 
     def _before_lookup(self, keyvalues, namemapping):
         return None
@@ -1372,7 +1472,17 @@ class FactTable(object):
         """Finalize the load."""
         pass
 
+class SAFactTable(FactTable):
+    def _init_sql(self):
+        meta = sa.MetaData()
+        self.sa_table = sa.Table(self.name, meta,
+                                 autoload=True,
+                                 autoload_with=self.targetconnection.engine)
 
+    def _insert(self, row, namemapping):
+        values = dict([(col.name, row[namemapping.get(col.name, col.name)]) for col in self.sa_table.columns])
+        ins = self.sa_table.insert().values(**values)
+        self.targetconnection.execute(ins)
 
 
 class BatchFactTable(FactTable):
@@ -1420,7 +1530,7 @@ class BatchFactTable(FactTable):
 class BulkFactTable(object):
     """Class for addition of facts to a fact table. Reads are not supported. """
 
-    def __init__(self, name, keyrefs, measures, bulkloader, 
+    def __init__(self, name, keyrefs, measures, bulkloader,
                  fieldsep='\t', rowsep='\n', nullsubst=None,
                  tempdest=None, bulksize=500000, usefilename=False):
         """Arguments:
@@ -1428,14 +1538,14 @@ class BulkFactTable(object):
            - keyrefs: a sequence of attribute names that constitute the
              primary key of the fact tables (i.e., the dimension references)
            - measures: a possibly empty sequence of measure names.
-           - bulkloader: A method 
+           - bulkloader: A method
              m(name, attributes, fieldsep, rowsep, nullsubst, tempdest)
              that is called to load data from a temporary file into the DW.
              The argument attributes is the combination of keyrefs and measures
-             and show the order in which the attribute values appear in the 
+             and show the order in which the attribute values appear in the
              temporary file. The rest of the arguments are similar to those
              described here.
-           - fieldsep: a string used to separate fields in the temporary 
+           - fieldsep: a string used to separate fields in the temporary
              file. Default: '\\t'
            - rowsep: a string used to separate rows in the temporary file.
              Default: '\\n'
@@ -1527,14 +1637,14 @@ class BulkFactTable(object):
     def __bulkloadnow(self):
         self.tempdest.flush()
         self.tempdest.seek(0)
-        self.bulkloader(self.name, self.all, 
+        self.bulkloader(self.name, self.all,
                         self.fieldsep, self.rowsep, self.nullsubst,
                         self.usefilename and self.__namedtempfile.name or \
                             self.tempdest)
         self.tempdest.seek(0)
         self.tempdest.truncate(0)
         self.__count = 0
-        
+
 
     def endload(self):
         """Finalize the load."""
@@ -1554,16 +1664,16 @@ class BulkFactTable(object):
             self.tempdest = self.__namedtempfile.file
 
 class SubprocessFactTable(object):
-    """Class for addition of facts to a subprocess. 
+    """Class for addition of facts to a subprocess.
 
-    The subprocess can, e.g., be a logger or bulkloader. Reads are not 
-    supported. 
+    The subprocess can, e.g., be a logger or bulkloader. Reads are not
+    supported.
 
-    Note that a created instance can not be used when endload() has been 
+    Note that a created instance can not be used when endload() has been
     called (and endload() is called from pygrametl.commit()).
     """
 
-    def __init__(self, keyrefs, measures, executable, 
+    def __init__(self, keyrefs, measures, executable,
                  initcommand=None, endcommand=None, terminateafter=-1,
                  fieldsep='\t', rowsep='\n', nullsubst=None,
                  buffersize=16384):
@@ -1595,7 +1705,7 @@ class SubprocessFactTable(object):
         self.fieldsep = fieldsep
         self.rowsep = rowsep
         self.nullsubst = nullsubst
-        self.process = Popen(executable, bufsize=buffersize, shell=True, 
+        self.process = Popen(executable, bufsize=buffersize, shell=True,
                              stdin=PIPE)
         self.pipe = self.process.stdin
 
@@ -1644,7 +1754,7 @@ class SubprocessFactTable(object):
         """Finalize the load."""
         if self.endcommand is not None:
             self.pipe.write(self.endcommand)
-        
+
         self.pipe.close()
         if self.terminateafter >= 0:
             sleep(self.terminateafter)
@@ -1663,8 +1773,8 @@ class SubprocessFactTable(object):
 
 
 class DecoupledDimension(pygrametl.parallel.Decoupled):
-    """A Dimension-like class that enables parallelism by executing all 
-       operations on a given Dimension in a separate, dedicated process 
+    """A Dimension-like class that enables parallelism by executing all
+       operations on a given Dimension in a separate, dedicated process
        (that Dimension is said to be "decoupled").
     """
 
@@ -1678,7 +1788,7 @@ class DecoupledDimension(pygrametl.parallel.Decoupled):
            - consumes: a sequence of Decoupled objects from which to fetch
              returnvalues (that are used to replace FutureResults in arguments).
              Default: ()
-           - attstoconsume: a sequence of the attribute names in rows that 
+           - attstoconsume: a sequence of the attribute names in rows that
              should have FutureResults replaced by actual return values. Does
              not have to be given, but may improve performance when given.
              Default: ()
@@ -1688,7 +1798,7 @@ class DecoupledDimension(pygrametl.parallel.Decoupled):
              Default: 500
            - queuesize: the maximum amount of waiting batches. Infinite if
              less than or equal to 0. NB: Large values do not necessarily give
-             good performance. 
+             good performance.
              Default: 200
         """
         pygrametl.parallel.Decoupled.__init__(
@@ -1737,8 +1847,8 @@ class DecoupledDimension(pygrametl.parallel.Decoupled):
 
 
 class DecoupledFactTable(pygrametl.parallel.Decoupled):
-    """A FactTable-like class that enables parallelism by executing all 
-       operations on a given FactTable in a separate, dedicated process 
+    """A FactTable-like class that enables parallelism by executing all
+       operations on a given FactTable in a separate, dedicated process
        (that FactTable is said to be "decoupled").
     """
 
@@ -1752,7 +1862,7 @@ class DecoupledFactTable(pygrametl.parallel.Decoupled):
            - consumes: a sequence of Decoupled objects from which to fetch
              returnvalues (that are used to replace FutureResults in arguments).
              Default: ()
-           - attstoconsume: a sequence of the attribute names in rows that 
+           - attstoconsume: a sequence of the attribute names in rows that
              should have FutureResults replaced by actual return values. Does
              not have to be given, but may improve performance when given.
              Default: ()
@@ -1762,7 +1872,7 @@ class DecoupledFactTable(pygrametl.parallel.Decoupled):
              Default: 500
            - queuesize: the maximum amount of waiting batches. Infinite if
              less than or equal to 0. NB: Large values do not necessarily give
-             good performance. 
+             good performance.
              Default: 200
         """
         pygrametl.parallel.Decoupled.__init__(
@@ -1792,7 +1902,7 @@ class DecoupledFactTable(pygrametl.parallel.Decoupled):
             return self._enqueue('lookup', row, namemapping)
         else:
             raise AttributeError, 'The object does not support lookup'
-        
+
     def ensure(self, row, namemapping={}):
         """Invoke ensure on the decoupled FactTable in the separate process"""
         if hasattr(self._obj, 'ensure'):
@@ -1804,7 +1914,7 @@ class DecoupledFactTable(pygrametl.parallel.Decoupled):
 #######
 
 class BasePartitioner(object):
-    """A base class for partitioning between several parts. 
+    """A base class for partitioning between several parts.
 
        See also DimensionPartitioner and FactTablePartitioner.
     """
@@ -1831,7 +1941,7 @@ class BasePartitioner(object):
 
     def getpart(self, row, namemapping={}):
         """Find  the part that should handle the given row. The provided
-        implementation in BasePartitioner does only use round robin 
+        implementation in BasePartitioner does only use round robin
         partitioning, but subclasses apply other methods """
         part = self.parts[self.__nextpart]
         self.__nextpart = (self.__nextpart + 1) % len(self.parts)
@@ -1859,7 +1969,7 @@ class DimensionPartitioner(BasePartitioner):
         Arguments:
         - parts: a sequence of Dimension objects.
         - getbyvalsfromall: determines if getbyvals should be answered by means
-          of all parts (when getbyvalsfromall = True) or only the first part, 
+          of all parts (when getbyvalsfromall = True) or only the first part,
           i.e., parts[0] (when getbybalsfromall = False). Default: False
         - partitioner: None or a callable p(dict) -> int where the argument
           is a dict mapping from the names of the lookupatts to the values of
@@ -1881,7 +1991,7 @@ class DimensionPartitioner(BasePartitioner):
         if partitioner is not None:
             self.partitioner = partitioner
         else:
-            # A partitioner that takes the hash of each attribute value in 
+            # A partitioner that takes the hash of each attribute value in
             # row and adds them all together:
             # Reading from right to left: get the values, use hash() on each
             # of them, and add all the hash values
@@ -1894,7 +2004,7 @@ class DimensionPartitioner(BasePartitioner):
         for att in self.lookupatts:
             vals[att] = row[namemapping.get(att) or att]
         return self.parts[self.partitioner(vals) % len(self.parts)]
-    
+
     # Below this, methods like those in Dimensions:
 
     def lookup(self, row, namemapping={}):
@@ -1923,7 +2033,7 @@ class DimensionPartitioner(BasePartitioner):
         for part in self.parts:
             res += part.getbyvals(values, namemapping)
         return res
-        
+
     def update(self, row, namemapping={}):
         """Invoke update on the relevant Dimension part"""
         keyval = row[namemapping.get(self.key) or self.key]
@@ -1998,11 +2108,11 @@ class FactTablePartitioner(BasePartitioner):
     def lookup(self, row, namemapping={}):
         """Invoke lookup on the relevant part """
         part = self.getpart(row, namemapping)
-        return part.lookup(row, namemapping)        
+        return part.lookup(row, namemapping)
 
     def ensure(self, row, namemapping={}):
         """Invoke ensure on the relevant part """
         part = self.getpart(row, namemapping)
-        return part.ensure(row, namemapping)        
+        return part.ensure(row, namemapping)
 
 
