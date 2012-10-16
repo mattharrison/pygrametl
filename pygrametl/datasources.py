@@ -1,5 +1,6 @@
-"""This module holds classes that can be used as data soures. A data source
-   must be iterable and provide dicts with data values.
+"""This module holds classes that can be used as data soures. Note that it is
+   easy to create other data sources: A data source must be iterable and
+   provide dicts that map from attribute names to attribute values.
 """
 
 # Copyright (c) 2009-2011, Christian Thomsen (chr@cs.aau.dk)
@@ -126,7 +127,7 @@ class ProcessSource(object):
         p.start()
 
     def __worker(self):
-        batch = []    
+        batch = []
         try:
             for row in self.__source:
                 batch.append(row)
@@ -156,7 +157,7 @@ class ProcessSource(object):
                 yield row
 
 BackgroundSource = ProcessSource # for compatability
-# The old thread-based BackgroundSource has been removed and 
+# The old thread-based BackgroundSource has been removed and
 # replaced by ProcessSource
 
 
@@ -269,7 +270,7 @@ class TransformingSource(object):
     def __init__(self, source, *transformations):
         """Arguments:
         - source: a data source
-        - *transformations: the transformations to apply. Must be callables 
+        - *transformations: the transformations to apply. Must be callables
           of the form func(row) where row is a dict. Will be applied in the
           given order.
         """
@@ -290,7 +291,7 @@ class CrossTabbingSource(object):
                  aggregator=None, nonevalue=0, sortrows=False):
         """Arguments:
         - source: the data source to pull data from
-        - rowvaluesatt: the name of the attribute that holds the values that 
+        - rowvaluesatt: the name of the attribute that holds the values that
           appear as rows in the result
         - colvaluesatt: the name of the attribute that holds the values that
           appear as columns in the result
@@ -313,9 +314,9 @@ class CrossTabbingSource(object):
             self.__aggregator = aggregator
         self.__nonevalue = nonevalue
         self.__sortrows = sortrows
-        self.__allcolumns = set()  
+        self.__allcolumns = set()
         self.__allrows = set()
-        
+
     def __iter__(self):
         for data in self.__source: # first we iterate over all source data ...
             row = data[self.__rowvaluesatt]
@@ -326,7 +327,7 @@ class CrossTabbingSource(object):
 
         # ... and then we build result rows
         for row in (self.__sortrows and sorted(self.__allrows) \
-                        or self.__allrows): 
+                        or self.__allrows):
             res = {self.__rowvaluesatt : row}
             for col in self.__allcolumns:
                 res[col] = \
@@ -414,12 +415,12 @@ class DynamicForEachSource(object):
     """
     def __init__(self, seq, callee):
         """Arguments:
-        - seq: A sequence with the elements for each of which a unique source 
+        - seq: A sequence with the elements for each of which a unique source
           must be created. The elements are given (one by one) to callee.
         - callee: A function f(e) that must accept elements as those in the seq
           argument. The function should return a source which then will be
           iterated by this source. The function is called once for every
-          element in seq. 
+          element in seq.
         """
         self.__queue = Queue()  # a multiprocessing.Queue
         if not callable(callee):
